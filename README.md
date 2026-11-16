@@ -42,4 +42,5 @@ streamlit run app.py
 
 ## Notes
 - The OECD page draws its chart with JavaScript, so the app tries the OECD SDMX data API first, then the page, and falls back to the 2024 OECD rates table.
-- Trading Economics sometimes blocks cloud servers. If that happens, the app tries each country's own yield page and otherwise uses a labeled snapshot. You can always type yields in manually.
+- All 10-year yields come from one page, `tradingeconomics.com/bonds`. The app fetches it with a browser-like request, retrying with `curl_cffi` if the site blocks the first attempt. Only if the table can't be read does it fall back to each country's own page on the same site (for example `tradingeconomics.com/belgium/government-bond-yield`).
+- If a yield still can't be fetched, the app shows a red warning and uses an illustrative snapshot that is not market data. Type today's yields into the sidebar overrides instead.

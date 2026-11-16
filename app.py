@@ -474,71 +474,123 @@ def fetch_tax_rates():
             "error": " | ".join(errors)}
 
 
+def _get_te(url, timeout=25):
+    """Fetch a Trading Economics page. Plain requests first; if TE's bot protection refuses it,
+    retry with curl_cffi, which presents a real Chrome TLS fingerprint."""
+    errs = []
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=timeout)
+        if r.status_code == 200 and len(r.text) > 5000:
+            return r.text, "requests"
+        errs.append(f"requests HTTP {r.status_code}")
+    except Exception as e:  # noqa: BLE001
+        errs.append(f"requests {type(e).__name__}")
+    try:
+        from curl_cffi import requests as creq
+        r = creq.get(url, impersonate="chrome", timeout=timeout,
+                     headers={"Accept-Language": "en-US,en;q=0.9"})
+        if r.status_code == 200:
+            return r.text, "curl_cffi"
+        errs.append(f"curl_cffi HTTP {r.status_code}")
+    except Exception as e:  # noqa: BLE001
+        errs.append(f"curl_cffi {type(e).__name__}: {e}")
+    raise RuntimeError("; ".join(errs))
+
+
+def _parse_te_bonds(html):
+    """Return {country: yield_decimal} and {country: quote_date} from the /bonds page HTML."""
+    rows, dates = {}, {}
+    # A) pandas over every table that has a 'Yield' column
+    try:
+        tables = pd.read_html(io.StringIO(html))
+    except ValueError:
+        tables = []
+    for t in tables:
+        cols = [str(c).strip() for c in t.columns]
+        t.columns = cols
+        ycol = next((c for c in cols if c.lower() == "yield"), None)
+        if ycol is None:
+            continue
+        name_col = next((c for c in cols if t[c].dtype == object and c != ycol), None)
+        if name_col is None:
+            continue
+        dcol = next((c for c in cols if c.lower() == "date"), None)
+        for _, row in t.iterrows():
+            name = norm_country(row[name_col])
+            y = pd.to_numeric(str(row[ycol]).replace("%", ""), errors="coerce")
+            if name and name.lower() != "nan" and pd.notna(y) and name not in rows:
+                rows[name] = float(y) / 100.0
+                dates[name] = str(row[dcol]) if dcol else ""
+    # B) raw <tr> rows: a cell ending in '10Y' or a country name, followed by a number
+    if len(rows) < 10:
+        soup = BeautifulSoup(html, "html.parser")
+        for tr in soup.select("tr"):
+            tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+            tds = [x for x in tds if x]
+            if len(tds) < 2:
+                continue
+            name = norm_country(tds[0])
+            y = pd.to_numeric(tds[1].replace("%", ""), errors="coerce")
+            if name and pd.notna(y) and name not in rows and not name[0].isdigit():
+                rows[name] = float(y) / 100.0
+                dates[name] = tds[-1]
+    return rows, dates
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_yields():
+    """Single source for all countries: tradingeconomics.com/bonds."""
     try:
-        r = _get(TE_URL)
-        html = r.text
-        rows = {}
-        dates = {}
-        # Approach A: pandas tables
-        try:
-            tables = pd.read_html(io.StringIO(html))
-        except ValueError:
-            tables = []
-        for t in tables:
-            cols = [str(c).strip() for c in t.columns]
-            ycol = next((c for c in cols if c.lower() == "yield"), None)
-            if ycol is None:
-                continue
-            t.columns = cols
-            name_col = next(c for c in cols if t[c].dtype == object)
-            dcol = next((c for c in cols if c.lower() == "date"), None)
-            for _, row in t.iterrows():
-                name = norm_country(row[name_col])
-                y = pd.to_numeric(str(row[ycol]).replace("%", ""), errors="coerce")
-                if name and pd.notna(y) and name not in rows:
-                    rows[name] = float(y) / 100.0
-                    dates[name] = str(row[dcol]) if dcol else ""
-        # Approach B: raw rows (in case pandas misses them)
+        html, via = _get_te(TE_URL)
+        rows, dates = _parse_te_bonds(html)
         if len(rows) < 10:
-            soup = BeautifulSoup(html, "html.parser")
-            for tr in soup.select("tr"):
-                tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-                if len(tds) < 3:
-                    continue
-                name = norm_country(tds[0] or tds[1])
-                nums = [pd.to_numeric(x.replace("%", ""), errors="coerce") for x in tds[1:3]]
-                y = next((n for n in nums if pd.notna(n)), np.nan)
-                if name and pd.notna(y) and name not in rows:
-                    rows[name] = float(y) / 100.0
-                    dates[name] = tds[-1]
-        if len(rows) < 10:
-            raise ValueError("Bond table not found (page may require JavaScript)")
+            raise ValueError(
+                f"Page downloaded via {via} ({len(html):,} chars) but the bond table was not in the "
+                "HTML (TE may be filling it with JavaScript for this server)")
         return {"yields": rows, "quote_dates": dates, "status": "Live",
-                "date": f"Quotes as of {dt.date.today():%b %d, %Y}", "fetched": _now(), "error": None}
+                "date": f"Quotes as of {dt.date.today():%b %d, %Y}", "fetched": _now(),
+                "error": None, "via": via}
     except Exception as e:  # noqa: BLE001
         return {"yields": {k: v / 100 for k, v in FALLBACK_YIELDS.items()}, "quote_dates": {},
-                "status": "Fallback", "date": "Illustrative 2026 snapshot", "fetched": _now(),
-                "error": f"{type(e).__name__}: {e}"}
+                "status": "Fallback", "date": "Illustrative snapshot (not market data)",
+                "fetched": _now(), "error": f"{type(e).__name__}: {e}", "via": None}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_country_yield(country: str):
-    """Secondary source: the country's own Trading Economics page (meta description)."""
-    slug = country.lower().replace(" ", "-")
+    """Primary source for the two yields the model uses: each country's own Trading Economics
+    page. Unlike /bonds (whose table is filled by JavaScript), these pages state the latest
+    quote in plain text, e.g. 'The yield on Belgium 10Y Bond Yield rose to 3.15% on
+    February 19, 2026'."""
+    slug = re.sub(r"[^a-z0-9]+", "-", country.lower()).strip("-")
+    url = TE_COUNTRY_URL.format(slug=slug)
     try:
-        r = _get(TE_COUNTRY_URL.format(slug=slug))
-        soup = BeautifulSoup(r.text, "html.parser")
-        meta = soup.find("meta", attrs={"name": "description"}) or soup.find(
-            "meta", attrs={"property": "og:description"})
-        text = meta["content"] if meta else soup.get_text(" ")
-        m = re.search(r"(?:rose|fell|increased|decreased|was|to|at)\s+(-?\d+\.?\d*)%", text)
-        if not m:
-            raise ValueError("Yield not found in page description")
-        return float(m.group(1)) / 100.0
-    except Exception:  # noqa: BLE001
-        return None
+        html, _ = _get_te(url)
+        soup = BeautifulSoup(html, "html.parser")
+        texts = []
+        for attrs in ({"name": "description"}, {"property": "og:description"}):
+            m = soup.find("meta", attrs=attrs)
+            if m and m.get("content"):
+                texts.append(m["content"])
+        texts.append(soup.get_text(" "))
+        pat_full = re.compile(
+            r"(?:rose|fell|increased|decreased|declined|climbed|was|edged up|edged down|held|"
+            r"remained|stood|steady)\s+(?:to|at)?\s*(-?\d+(?:\.\d+)?)%\s+on\s+"
+            r"([A-Z][a-z]+\s+\d{1,2},\s+\d{4})")
+        for t in texts:
+            m = pat_full.search(t)
+            if m:
+                return {"value": float(m.group(1)) / 100.0, "date": m.group(2), "status": "Live",
+                        "url": url, "error": None, "fetched": _now()}
+        for t in texts:
+            m = re.search(r"(?:yield|Yield)[^%]{0,80}?(-?\d+\.\d+)%", t)
+            if m:
+                return {"value": float(m.group(1)) / 100.0, "date": "latest quote", "status": "Live",
+                        "url": url, "error": None, "fetched": _now()}
+        raise ValueError("Yield not found on country page")
+    except Exception as e:  # noqa: BLE001
+        return {"value": None, "date": None, "status": "Failed", "url": url,
+                "error": f"{type(e).__name__}: {e}", "fetched": _now()}
 
 
 # ---------------------------------------------------------------------------
@@ -648,10 +700,26 @@ with st.sidebar:
     f_tax_raw = tax_rates.get(country)
     f_tax_missing = f_tax_raw is None
     f_tax_fetched = (f_tax_raw if f_tax_raw is not None else tax_rates.get("United States", 25.8)) / 100
+    # The two yields the model uses come from each country's own TE page (most reliable),
+    # then the /bonds table, then the labeled snapshot.
+    yield_info = {}
+    pages = {}
+    for cname in dict.fromkeys(["United States", country]):
+        if yld_src["status"] == "Live" and cname in yld_src["yields"]:
+            qd = yld_src["quote_dates"].get(cname, "")
+            yield_info[cname] = ("Live", f"TE /bonds {qd}".strip(), TE_URL)
+            continue
+        page = fetch_country_yield(cname)          # backup: same source, country page
+        pages[cname] = page
+        if page["value"] is not None:
+            yields[cname] = page["value"]
+            yield_info[cname] = ("Live", f"TE country page, {page['date']}", page["url"])
+        else:
+            yield_info[cname] = ("Fallback", yld_src["date"], TE_URL)
+    us_page = pages.get("United States", {"fetched": yld_src["fetched"], "error": None})
+    f_page = pages.get(country, {"error": None})
     rf_us_fetched = yields.get("United States", FALLBACK_YIELDS["United States"] / 100)
-    rf_f_fetched = yields.get(country)
-    if rf_f_fetched is None:
-        rf_f_fetched = fetch_country_yield(country) or rf_us_fetched
+    rf_f_fetched = yields.get(country, rf_us_fetched)
 
     beta_u, ov_beta = override("Unlevered beta", "beta", beta_fetched, 0.0, 5.0, 0.01, "x", 1.0)
     us_tax, ov_ustax = override("U.S. tax rate", "ustax", us_tax_fetched, 0.0, 60.0, 0.1)
@@ -683,7 +751,16 @@ fc = ccy(country)
 # ---------------------------------------------------------------------------
 # Hero
 # ---------------------------------------------------------------------------
-statuses = [betas["status"], spread_src["status"], tax_src["status"], yld_src["status"]]
+yld_used_status = "Live" if all(v[0] == "Live" for v in yield_info.values()) else "Fallback"
+yld_used = {
+    "status": yld_used_status,
+    "date": " · ".join(f"{k}: {v[1]}" for k, v in yield_info.items()) if country != "United States"
+            else f"United States: {yield_info['United States'][1]}",
+    "fetched": us_page["fetched"],
+    "error": " | ".join(e for e in [us_page.get("error"), f_page.get("error"),
+                                     yld_src.get("error")] if e) or None,
+}
+statuses = [betas["status"], spread_src["status"], tax_src["status"], yld_used_status]
 live_n = statuses.count("Live")
 st.markdown(
     f"""
@@ -706,6 +783,10 @@ st.markdown(
 if f_tax_missing and not ov_ftax:
     st.warning(f"No OECD tax rate found for {country}; using the U.S. rate. "
                "Switch on the override in the sidebar to enter one.")
+if yld_used_status != "Live" and not (ov_rfus and ov_rff):
+    st.error("The 10-year yields could not be fetched live, so the app is using an illustrative "
+             "snapshot that is NOT current market data. Type today's yields from "
+             "tradingeconomics.com into the overrides in the sidebar.")
 if live_n < 4:
     st.info("Some sources couldn't be reached, so labeled fallback snapshots are in use. "
             "See **The Cellar** tab for details, or click **Uncork fresh data** to retry.")
@@ -915,7 +996,7 @@ with tab4:
         ("Corporate tax rate", f"U.S. {fmt(us_tax_fetched,1)} · {country} {fmt(f_tax_fetched,1)}",
          "OECD Corporate Tax Statistics", OECD_URL, tax_src, ov_ustax or ov_ftax),
         ("10Y government yields", f"U.S. {fmt(rf_us_fetched)} · {country} {fmt(rf_f_fetched)}",
-         "Trading Economics", TE_URL, yld_src, ov_rfus or ov_rff),
+         "Trading Economics /bonds", TE_URL, yld_used, ov_rfus or ov_rff),
     ]
     html = ["<table style='width:100%;border-collapse:collapse'>",
             "<tr style='text-align:left;border-bottom:2px solid #6D1A36'>"
@@ -941,7 +1022,10 @@ with tab4:
     with e1:
         with st.expander("10Y government yields (all countries)"):
             ydf = pd.DataFrame(
-                [(f"{flag(k)} {k}", v * 100, yld_src["quote_dates"].get(k, "")) for k, v in yields.items()],
+                [(f"{flag(k)} {k}", v * 100,
+                  yield_info[k][1] if k in yield_info and yield_info[k][0] == "Live"
+                  else (yld_src["quote_dates"].get(k, "") if yld_src["status"] == "Live" else "snapshot, not live"))
+                 for k, v in yields.items()],
                 columns=["Country", "Yield (%)", "Quote date"]).sort_values("Country")
             st.dataframe(ydf, hide_index=True, use_container_width=True)
     with e2:
